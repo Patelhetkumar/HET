@@ -2,7 +2,6 @@ import subprocess
 import yaml
 import os
 import re
-import json
 
 # Load inventory file path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -17,21 +16,17 @@ def get_efs_server_output():
     for line in result.stdout.strip().split("\n"):
         parts = line.strip().split()
         if len(parts) >= 4:
-            server_name = parts[0]
-            domain = parts[1]
-            host_type = parts[2]
-            group = parts[3]
-            
+            server_name, domain, host_type, group = parts[:4]
             servers[server_name] = {
                 "domain": domain,
                 "type": host_type,
-                "group": group
+                "group": group,
+                "cells": set()
             }
-
     return servers
 
 def load_inventory():
-    """Loads inventory servers, groups, and assigned cells from inventory.prod.yaml."""
+    """Loads inventory data from inventory.prod.yaml."""
     try:
         with open(inventory_file, 'r') as file:
             inventory = yaml.safe_load(file)
@@ -49,15 +44,14 @@ def load_inventory():
             continue  
 
         if "hosts" in group_data and isinstance(group_data["hosts"], dict):
-            for host in group_data["hosts"]:
-                pattern = re.escape(host.split(".")[0]) + ".*"
+            for server, details in group_data["hosts"].items():
+                pattern = re.escape(server.split(".")[0]) + ".*"
                 pattern_to_group[pattern] = group  
 
-            for server, details in group_data["hosts"].items():
                 if isinstance(details, dict):
                     inventory_servers[server] = {
                         "group": group,
-                        "cells": set(details.get("cells", [])) if "cells" in details else set()
+                        "cells": set(details.get("cells", []))
                     }
 
     return inventory_servers, pattern_to_group
@@ -69,18 +63,22 @@ def determine_group_from_pattern(server_name, pattern_to_group):
             return group
     return "NO_MATCH_FOUND"
 
-def format_output_set(cell_set):
-    """Formats set output to match expected format."""
-    return {cell.replace(" ", "") for cell in cell_set}
+def extract_efs_cells(server_name):
+    """Dynamically generate EFS cell names from server structure."""
+    prefix = server_name.split('efs')[0]
+    return {
+        f"p.{prefix}.ml.com",
+        f"d.{prefix}.ml.com"
+    }
 
 def compare_efs_with_inventory():
-    """Compares real-time EFS data against inventory.prod.yaml dynamically."""
+    """Compares EFS database against inventory.prod.yaml dynamically."""
     efs_data = get_efs_server_output()
     inventory_data, pattern_to_group = load_inventory()
 
     mismatches = []
-    outdated_servers = list(set(inventory_data.keys()) - set(efs_data.keys()))
-    missing_servers = list(set(efs_data.keys()) - set(inventory_data.keys()))
+    outdated_servers = set(inventory_data.keys()) - set(efs_data.keys())
+    missing_servers = set(efs_data.keys()) - set(inventory_data.keys())
 
     if outdated_servers:
         print("\n🚨 Outdated (Decommissioned) Servers in Inventory (Not in EFS):")
@@ -100,27 +98,24 @@ def compare_efs_with_inventory():
         expected_group = determine_group_from_pattern(server, pattern_to_group)
         actual_group = efs_details["group"]
 
-        # **Fix Cell Extraction**
-        expected_cells = format_output_set(inventory_details.get("cells", set()))
-        actual_cells = format_output_set({f"p.{server.split('efs')[0]}.ml.com"})
+        expected_cells = inventory_details.get("cells", set())
+        actual_cells = extract_efs_cells(server)
 
-        # **Fix Group Assignment**
         if expected_group == "NO_MATCH_FOUND" and server in inventory_data:
             expected_group = inventory_data[server]["group"]
 
         if expected_group == actual_group and expected_cells == actual_cells:
-            continue
+            continue  # Server matches, no mismatch.
+
+        # Ensure proper formatting of sets
+        missing_cells = expected_cells - actual_cells
+        extra_cells = actual_cells - expected_cells
 
         mismatch_report = f"\n🔍 Mismatch for server: {server}"
         mismatch_report += f"\n - Expected Group (AX Inventory): {expected_group}"
         mismatch_report += f"\n - Actual Group (EFS Database): {actual_group}"
-
-        missing_cells = expected_cells - actual_cells
-        extra_cells = actual_cells - expected_cells
-
-        if expected_cells or actual_cells:
-            mismatch_report += f"\n - Efs Database: {sorted(actual_cells)}"
-            mismatch_report += f"\n - Ax inventory: {sorted(expected_cells)}"
+        mismatch_report += f"\n - Efs Database: {sorted(actual_cells)}"
+        mismatch_report += f"\n - Ax inventory: {sorted(expected_cells)}"
 
         if missing_cells:
             mismatch_report += f"\n - Cells in the AX inventory but not in the EFS Database: {sorted(missing_cells)}"
