@@ -31,7 +31,6 @@ def get_efs_server_output():
 
     return servers
 
-
 def load_inventory():
     """Loads inventory servers, groups, and assigned cells from inventory.prod.yaml."""
     try:
@@ -49,27 +48,29 @@ def load_inventory():
 
     for group, group_data in all_groups.items():
         if isinstance(group_data, dict):
-            if "pattern" in group_data:
-                pattern_to_group[group_data["pattern"]] = group  # Extract patterns dynamically
+            # Extracting patterns correctly
+            for host in group_data.get("hosts", {}):
+                pattern = host.split(".")[0] + ".*"  # Convert server name into a regex pattern
+                pattern_to_group[pattern] = group  # Assign it to the group
 
+            # Extracting hosts and cells
             if "hosts" in group_data and isinstance(group_data["hosts"], dict):
                 for server, details in group_data["hosts"].items():
-                    if isinstance(details, dict):
-                        inventory_servers[server] = {
-                            "group": group,
-                            "cells": set(details.get("cells", [])) if "cells" in details else set()
-                        }
+                    inventory_servers[server] = {
+                        "group": group,
+                        "cells": set(details.get("cells", [])) if "cells" in details else set()
+                    }
 
     return inventory_servers, pattern_to_group
-
 
 def determine_group_from_pattern(server_name, pattern_to_group):
     """Determine the correct group dynamically based on pattern matching."""
     for pattern, group in pattern_to_group.items():
         if re.match(pattern, server_name):
             return group
-    return "UNKNOWN_GROUP"
-
+    return "NO_MATCH_FOUND"  # Change from UNKNOWN_GROUP to NO_MATCH_FOUND for better debugging
+print("🔍 DEBUG: Extracted Pattern-to-Group Mapping:")
+print(json.dumps(pattern_to_group, indent=4))
 
 def compare_efs_with_inventory():
     """Compares real-time EFS data against inventory.prod.yaml dynamically."""
