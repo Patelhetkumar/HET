@@ -97,7 +97,13 @@ for server_nm in efs_servers1:
     elif host_type == "prod" and "dev" in group:
         mismatches_servergroup.add(f"Mismatch: {server_nm} {host_type} in prod group but should be in dev.")
 
-# Updated `compare_cells` function matching your expected output format
+def determine_group_from_pattern(server_name):
+    """Determine the group dynamically based on the pattern-to-group mapping."""
+    for pattern, group in PATTERN_TO_GROUP.items():
+        if re.match(pattern, server_name):
+            return group
+    return "UNKNOWN_GROUP"  # Default if no match is found
+
 def compare_cells(efsservers_data, inventory_data):
     """Compare expected and actual cells and print discrepancies to console."""
     
@@ -161,6 +167,7 @@ def compare_cells(efsservers_data, inventory_data):
     else:
         print("==========================================================")
         print("Controlgroup A and B are correctly balanced for high availability. \n")
+
 
 # Validate inventory by comparing EFS servers
 def validate_inventory_with_efs():
