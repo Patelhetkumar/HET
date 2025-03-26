@@ -5,109 +5,87 @@ import subprocess
 import sys
 from collections import deque
 
-#################################
-# 1) Name & Cell Normalization
-#################################
+################################################################################
+# 1) Helpers to Remove ALL Non-Essential Spaces/Characters
+################################################################################
 
-def remove_spaces_in_string(s):
+def strip_nonessential_chars(s):
     """
-    Removes ALL spaces in a string: "abc . com" -> "abc.com".
+    Removes ANY whitespace and certain extraneous punctuation, leaving only:
+      - letters (a-z, A-Z)
+      - digits (0-9)
+      - dots (.)
+      - underscores (_)
+      - hyphens (-)
+    Everything else is nuked. This helps if hidden or weird whitespace is present.
+    Example:
+      "p. usva02. ric. amrs.ml.com" -> "p.usva02.ric.amrs.ml.com"
     """
-    return re.sub(r"\s+", "", s)
+    # Lowercase first
+    s = s.lower()
+    # Remove all non [a-z0-9._-] characters
+    s = re.sub(r'[^a-z0-9._-]+', '', s)
+    return s
 
 def unify_name(full_name):
     """
-    1) Remove all spaces from the raw name
-    2) Strip everything after the first '.' to remove domain
-    3) Lowercase
-    4) Remove trailing digits after 'efs|efsd|efsp|pefs|cefs'
-       e.g. lauaulcefsp899 -> lauaulcefsp
+    1) Nuke all extraneous whitespace/punctuation except [a-z0-9._-].
+    2) Strip everything after first '.' to remove domain portion.
+    3) Remove trailing digits after efs|efsd|efsp|pefs|cefs.
     """
-    full_name = remove_spaces_in_string(full_name)
-    short = full_name.split('.', 1)[0].lower()
+    full_name = strip_nonessential_chars(full_name)
+    # separate at first dot
+    parts = full_name.split('.', 1)
+    short = parts[0] if parts else full_name
+
+    # remove trailing digits after efs/efsd/efsp/pefs/cefs
     short = re.sub(r'(efs[dp]?|pefs|cefs)(\d+)$', r'\1', short)
     return short
 
-def remove_extra_spaces_in_domain(cell):
-    """
-    Removes weird spacing around dots: 
-      "p. usva02. ric. amrs.ml.com" -> "p.usva02.ric.amrs.ml.com"
-    and then remove leftover spaces.
-    """
-    # remove spaces around '.' => "p. usva02. ric" -> "p.usva02.ric"
-    cell = re.sub(r"\s*\.\s*", ".", cell)
-    # remove leftover multiple spaces
-    cell = re.sub(r"\s+", "", cell)
-    return cell
-
 def normalize_cell(cell_name):
     """
-    - Remove all spaces around dots
-    - Convert .m1.com -> .ml.com
-    - Lowercase
+    1) Nuke extraneous chars except [a-z0-9._-].
+    2) Convert .m1.com -> .ml.com
     """
-    cell_name = cell_name.strip().lower()
+    cell_name = strip_nonessential_chars(cell_name)
     cell_name = cell_name.replace(".m1.com", ".ml.com")
-    cell_name = remove_extra_spaces_in_domain(cell_name)
     return cell_name
 
-#################################
-# 2) EFS Parsing (Storing Raw & Short Names)
-#################################
+################################################################################
+# 2) EFS Data (Storing Short -> {cells}, also a map for Original Name)
+################################################################################
 
 def get_efs_server_output():
-    """
-    Runs efs display efsserver => lines in format: server, cell, dev/prod, group
-    We'll:
-      - unify short name for matching
-      - store raw EFS name (with all spaces removed) for final mismatch printing
-      - store cell sets
-    Returns:
-      efs_data = { short_name -> set_of_cells }
-      efs_raw_map = { short_name -> raw_server_name_without_spaces }
-    """
     cmd = """efs display efsserver | sed -e '1,/^==*/d' | awk '{print $2 ", " $1 ", " $3 ", " $4}'"""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
 
     efs_data = {}
     efs_raw_map = {}
-
     for line in result.stdout.strip().split("\n"):
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 4:
+        if len(parts) < 4: 
             continue
-        raw_srv, raw_cell, _, _ = parts
+        raw_server_name, raw_cell, _, _ = parts
 
-        # Remove ALL spaces from the raw server name
-        raw_srv_no_spaces = remove_spaces_in_string(raw_srv)
-        short_srv = unify_name(raw_srv_no_spaces)
-
-        if short_srv not in efs_raw_map:
-            efs_raw_map[short_srv] = raw_srv_no_spaces  # keep the fully de-spaced raw name
+        short_name = unify_name(raw_server_name)
+        if short_name not in efs_raw_map:
+            # Just store raw server name "as is" (or we could store the nuked version)
+            efs_raw_map[short_name] = raw_server_name
 
         cell_val = normalize_cell(raw_cell)
-        if short_srv not in efs_data:
-            efs_data[short_srv] = set()
-        efs_data[short_srv].add(cell_val)
+        if short_name not in efs_data:
+            efs_data[short_name] = set()
+        efs_data[short_name].add(cell_val)
 
     return efs_data, efs_raw_map
 
-#################################
-# 3) BFS Inventory (Storing Raw & Short)
-#################################
+################################################################################
+# 3) BFS Inventory (Storing Short -> {cells}, also Original Name Map)
+################################################################################
 
 def load_inventory_anywhere(inventory_file):
-    """
-    BFS-scans entire inventory.prod.yaml, collecting any 'hosts:' blocks.
-    - unify short name for matching
-    - store raw name with spaces removed
-    - store cells
-    Returns:
-      inv_data = { short_srv -> set_of_cells }
-      inv_raw_map = { short_srv -> raw_server_name_without_spaces }
-    """
     if not os.path.isfile(inventory_file):
-        print(f"❌ Error: Inventory file '{inventory_file}' not found.")
+        print(f"❌ Error: file not found: {inventory_file}")
         sys.exit(1)
 
     with open(inventory_file, 'r') as f:
@@ -120,22 +98,17 @@ def load_inventory_anywhere(inventory_file):
     while queue:
         node = queue.popleft()
         if isinstance(node, dict):
-            # if node has 'hosts'
             hosts = node.get("hosts", {})
             if isinstance(hosts, dict):
                 for raw_srv, details in hosts.items():
                     if isinstance(details, dict):
-                        # remove spaces from raw server
-                        raw_srv_no_spaces = remove_spaces_in_string(raw_srv)
-                        short_srv = unify_name(raw_srv_no_spaces)
+                        short_srv = unify_name(raw_srv)
                         if short_srv not in inv_raw_map:
-                            inv_raw_map[short_srv] = raw_srv_no_spaces
-
+                            inv_raw_map[short_srv] = raw_srv
                         cell_list = details.get("cells", [])
                         norm_cells = {normalize_cell(c) for c in cell_list}
                         inv_data[short_srv] = norm_cells
 
-            # BFS deeper
             for v in node.values():
                 if isinstance(v, dict):
                     queue.append(v)
@@ -150,15 +123,11 @@ def load_inventory_anywhere(inventory_file):
 
     return inv_data, inv_raw_map
 
-#################################
+################################################################################
 # 4) Compare & Print
-#################################
+################################################################################
 
 def compare_cells(efs_data, efs_raw_map, inv_data, inv_raw_map):
-    """
-    Compare EFS vs. Inventory by short name. Then print mismatches with the full raw name
-    from EFS if available, else from Inventory, else fallback to short name.
-    """
     efs_srvs = set(efs_data.keys())
     inv_srvs = set(inv_data.keys())
 
@@ -169,7 +138,6 @@ def compare_cells(efs_data, efs_raw_map, inv_data, inv_raw_map):
         print("\nServers found in EFS Database but not in ax_inventories:")
         print("==========================================================")
         for short_srv in missing_in_inventory:
-            # prefer raw EFS name
             raw_name = efs_raw_map.get(short_srv, short_srv)
             print(raw_name)
 
@@ -177,7 +145,6 @@ def compare_cells(efs_data, efs_raw_map, inv_data, inv_raw_map):
         print("\nServers found in ax_inventories but not in Efs Database or efsserver.txt:")
         print("==========================================================")
         for short_srv in missing_in_efs:
-            # not in EFS, so fallback to inventory raw name
             raw_name = inv_raw_map.get(short_srv, short_srv)
             print(raw_name)
 
@@ -187,18 +154,21 @@ def compare_cells(efs_data, efs_raw_map, inv_data, inv_raw_map):
         inv_cells = inv_data[short_srv]
 
         if efs_cells != inv_cells:
-            # pick a raw name to show:
-            if short_srv in efs_raw_map:
-                full_name = efs_raw_map[short_srv]
-            elif short_srv in inv_raw_map:
-                full_name = inv_raw_map[short_srv]
+            # Choose which raw name to show in mismatch
+            # Prefer EFS raw name if available, else fallback to Inventory raw
+            raw_efs = efs_raw_map.get(short_srv)
+            raw_inv = inv_raw_map.get(short_srv)
+            if raw_efs:
+                display_name = raw_efs
+            elif raw_inv:
+                display_name = raw_inv
             else:
-                full_name = short_srv  # last fallback
+                display_name = short_srv
 
             missing_cells = efs_cells - inv_cells
             extra_cells   = inv_cells - efs_cells
 
-            print(f"\nMismatch for server: {full_name}")
+            print(f"\nMismatch for server: {display_name}")
             print(f" Efs Database: {efs_cells}")
             print(f" Ax inventory: {inv_cells}")
 
@@ -207,9 +177,9 @@ def compare_cells(efs_data, efs_raw_map, inv_data, inv_raw_map):
             if extra_cells:
                 print(f" Cells in the Ax inventory but not in the Efs Database: {extra_cells}")
 
-#################################
+################################################################################
 # 5) Orchestrator
-#################################
+################################################################################
 
 def validate_inventory_with_efs(inventory_file):
     efs_data, efs_raw_map = get_efs_server_output()
