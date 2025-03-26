@@ -98,13 +98,14 @@ def compare_efs_with_inventory():
         mismatch_report += f"\n - Expected Group (Inventory): {expected_group}"
         mismatch_report += f"\n - Actual Group (EFS): {actual_group}"
 
-        # Cell mismatches
+        # Correcting the missing/extra cell reporting
         missing_cells = expected_cells - actual_cells
         extra_cells = actual_cells - expected_cells
 
-        if missing_cells or extra_cells:
-            mismatch_report += f"\n - Cells in the AX inventory but not in the EFS Database: {missing_cells}" if missing_cells else ""
-            mismatch_report += f"\n - Cells in the EFS Database but not in the AX inventory: {extra_cells}" if extra_cells else ""
+        if missing_cells:
+            mismatch_report += f"\n - Cells in the AX inventory but not in the EFS Database: {sorted(missing_cells)}"
+        if extra_cells:
+            mismatch_report += f"\n - Cells in the EFS Database but not in the AX inventory: {sorted(extra_cells)}"
 
         mismatches.append(mismatch_report)
 
