@@ -4,37 +4,25 @@ import os
 import subprocess
 import sys
 
+def strip_domain(full_name):
+    # If there's no dot, it won't crash; it just returns the entire string in lowercase
+    return full_name.split('.', 1)[0].lower()
+
 def get_efs_server_output():
-    """
-    Executes the efs display command (with 4 columns: server_name, domain/cell, dev/prod, group)
-    and returns a dict: {server_name -> set_of_cells}.
-    Example line format:
-      lauaulcefsp899.apac.sdi.corp.bankofamerica.com, d.auau2p.syd.aja.ml.com, prod, lauaulcefsp899...
-    """
-    # This command produces lines in the format:
-    #   server, domain/cell, dev/prod, group
     cmd = """efs display efsserver | sed -e '1,/^==*/d' | awk '{print $2 ", " $1 ", " $3 ", " $4}'"""
-    
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
     efs_data = {}
 
     for line in result.stdout.strip().split("\n"):
-        # line might look like: "lauaulcefsp899..., d.auau2p.syd.aja.ml.com, prod, lauaulcefsp899..."
         parts = [p.strip() for p in line.strip().split(",")]
-        # We expect 4 parts: [0]=server_name, [1]=domain/cell, [2]=dev/prod, [3]=group
         if len(parts) < 4:
-            continue  # skip malformed lines
-
-        # Normalize
-        server_name = parts[0].lower()
-        cell_name   = parts[1].lower()
-        host_type   = parts[2].lower()
-        group_name  = parts[3].lower()
-
-        # In your example, you want to store cell_name in a set
+            continue
+        # Use strip_domain here
+        server_name = strip_domain(parts[0])
+        cell_name   = parts[1].lower().strip()
+        # etc.
         if server_name not in efs_data:
             efs_data[server_name] = set()
-        # Add the domain/cell to the set
         efs_data[server_name].add(cell_name)
 
     return efs_data
@@ -59,6 +47,7 @@ def load_inventory(inventory_file):
         hosts = data.get("hosts", {})
         if isinstance(hosts, dict):
             for srv, details in hosts.items():
+                short_srv = strip_domain(srv)
                 normalized_srv = srv.strip().lower()
                 if isinstance(details, dict):
                     # In your YAML, 'cells' is often a list. Turn it into a set.
