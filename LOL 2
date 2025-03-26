@@ -100,8 +100,13 @@ def compare_efs_with_inventory():
         expected_group = determine_group_from_pattern(server, pattern_to_group)
         actual_group = efs_details["group"]
 
+        # **Fix Cell Extraction**
         expected_cells = format_output_set(inventory_details.get("cells", set()))
         actual_cells = format_output_set({f"p.{server.split('efs')[0]}.ml.com"})
+
+        # **Fix Group Assignment**
+        if expected_group == "NO_MATCH_FOUND" and server in inventory_data:
+            expected_group = inventory_data[server]["group"]
 
         if expected_group == actual_group and expected_cells == actual_cells:
             continue
