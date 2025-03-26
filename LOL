@@ -38,13 +38,21 @@ def load_ax_inventory():
 
     # Extract group assignments from AX Inventory
     all_groups = inventory.get('all', {}).get('children', {})
+    
     for group, group_data in all_groups.items():
-        if "hosts" in group_data and isinstance(group_data["hosts"], dict):
-            for server, details in group_data["hosts"].items():
-                ax_mappings[server] = {
-                    "group": group,
-                    "cells": set(details.get("cells", []))
-                }
+        if not isinstance(group_data, dict) or "hosts" not in group_data:
+            print(f"Warning: Group '{group}' has no valid 'hosts' data. Skipping.")
+            continue  # Skip groups with no host data
+        
+        for server, details in group_data["hosts"].items():
+            if not isinstance(details, dict):
+                print(f"Warning: Server '{server}' in group '{group}' has invalid details. Skipping.")
+                continue  # Skip malformed entries
+            
+            ax_mappings[server] = {
+                "group": group,
+                "cells": set(details.get("cells", [])) if "cells" in details else set()
+            }
 
     return ax_mappings
 
