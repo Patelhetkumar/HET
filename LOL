@@ -1,186 +1,109 @@
+import subprocess
 import yaml
 import re
 import os
-import subprocess
 
-# Load inventory YAML file
+# Load AX Inventory file
 script_dir = os.path.dirname(os.path.abspath(__file__))
-inventory_file = os.path.join(script_dir, '..', 'prod', 'inventory.prod.yaml')
-
-def load_inventory_groups():
-    """Load server group mappings from the YAML file."""
-    with open(inventory_file, 'r') as file:
-        inventory = yaml.safe_load(file)
-
-    group_mappings = {}
-    
-    # Extract all server groups from YAML
-    all_groups = inventory.get('all', {}).get('children', {})
-
-    # Loop through groups and extract host-to-group mappings
-    for group, group_data in all_groups.items():
-        if "hosts" in group_data and isinstance(group_data["hosts"], dict):
-            for server, details in group_data["hosts"].items():
-                if isinstance(details, dict) and "group" in details:
-                    group_mappings[server] = details["group"]  # Assign server to its group
-
-    return group_mappings
+inventory_file = os.path.join(script_dir, '..', 'prod', 'ax_inventory.prod.yaml')
 
 def get_efs_server_output():
-    """Executes the command and returns parsed EFS server details dynamically."""
+    """Extracts server details from 'efs display efsserver' command dynamically."""
     cmd = "efs display efsserver | awk 'NR>3 {print $2 \" \" $1 \" \" $3 \" \" $4}'"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
 
-    servers = []
+    servers = {}
     for line in result.stdout.strip().split("\n"):
         parts = line.strip().split()
-        if len(parts) >= 4:  # Ensure it has server_name, domain, host_type, group
+        if len(parts) >= 4:  # Ensure at least: server_name, domain, type, group
             server_name = parts[0]  # E.g., laau42efs899
             domain = parts[1]       # E.g., apac.sdi.corp.bankofamerica.com
             host_type = parts[2]    # E.g., dev/prod
             group = parts[3]        # E.g., l_aja_ausyb01sr1
             
-            servers.append((server_name, domain, host_type, group))
+            servers[server_name] = {
+                "domain": domain,
+                "type": host_type,
+                "group": group
+            }
 
     return servers
 
-def create_dynamic_pattern_to_group(group_mappings):
-    """Dynamically builds PATTERN_TO_GROUP using EFS output and YAML mappings."""
-    servers = get_efs_server_output()
-    pattern_to_group = {}
+def load_ax_inventory():
+    """Loads predefined group mappings from AX inventory."""
+    with open(inventory_file, 'r') as file:
+        inventory = yaml.safe_load(file)
 
-    for server_name, _, _, actual_group in servers:
-        # Extract pattern prefix (e.g., 'laau42efs' from 'laau42efs899')
-        match = re.match(r"([a-z0-9]+)efs", server_name)
-        if match:
-            pattern = rf"{match.group(1)}efs.*"  # e.g., "laau42efs.*"
-            
-            # Use YAML mapping if available, else use actual group
-            assigned_group = group_mappings.get(server_name, actual_group)
-            pattern_to_group[pattern] = assigned_group
+    ax_mappings = {}
 
-    return pattern_to_group
+    # Extract group assignments from AX Inventory
+    all_groups = inventory.get('all', {}).get('children', {})
+    for group, group_data in all_groups.items():
+        if "hosts" in group_data and isinstance(group_data["hosts"], dict):
+            for server, details in group_data["hosts"].items():
+                ax_mappings[server] = {
+                    "group": group,
+                    "cells": set(details.get("cells", []))
+                }
 
-# Load group mappings from YAML
-group_mappings = load_inventory_groups()
+    return ax_mappings
 
-# Generate the dynamic pattern-to-group mapping
-PATTERN_TO_GROUP = create_dynamic_pattern_to_group(group_mappings)
+def compare_efs_with_ax_inventory():
+    """Compares dynamically extracted EFS data against AX Inventory."""
+    efs_data = get_efs_server_output()
+    ax_inventory = load_ax_inventory()
 
-# Load EFS servers dynamically
-def load_efs_unique_servers():
-    """Load unique EFS servers dynamically from command output."""
-    servers = {}
-    efs_servers = get_efs_server_output()
-    for server, _, host_type, _ in efs_servers:
-        servers[server] = host_type  # Store the environment type (dev/prod)
+    print("\n==== DEBUG: Comparing EFS Data with AX Inventory ====")
 
-    return servers
-
-# Load EFS servers
-efs_servers1 = load_efs_unique_servers()
-
-# Validate server placement
-mismatches_servergroup = set()
-
-for server_nm in efs_servers1:
-    group = PATTERN_TO_GROUP.get(server_nm, "UNKNOWN_GROUP")
-    host_type = efs_servers1[server_nm]
-
-    if server_nm in group_mappings:
-        expected_group = group_mappings[server_nm]
-        if group != expected_group:
-            mismatches_servergroup.add(f"Mismatch: {server_nm} assigned to {group} but expected {expected_group}.")
-    
-    if host_type == "dev" and "prod" in group:
-        mismatches_servergroup.add(f"Mismatch: {server_nm} {host_type} in dev group but should be in prod.")
-    elif host_type == "prod" and "dev" in group:
-        mismatches_servergroup.add(f"Mismatch: {server_nm} {host_type} in prod group but should be in dev.")
-
-def determine_group_from_pattern(server_name):
-    """Determine the group dynamically based on the pattern-to-group mapping."""
-    for pattern, group in PATTERN_TO_GROUP.items():
-        if re.match(pattern, server_name):
-            return group
-    return "UNKNOWN_GROUP"  # Default if no match is found
-
-def normalize_cell(cell_name):
-    """Normalize cell names to remove inconsistencies (e.g., extra spaces, domain variations)."""
-    cell_name = cell_name.strip()  # Remove leading/trailing spaces
-    cell_name = re.sub(r'\s+', '', cell_name)  # Remove internal spaces
-    cell_name = cell_name.replace(".m1.com", ".ml.com")  # Standardize domain variations
-    return cell_name
-
-def compare_cells(efsservers_data, inventory_data):
-    """Compare expected and actual cells and print discrepancies to console."""
-    
-    mismatches = []  # ✅ Initialize mismatches list
-
-    # Identify missing and extra servers
-    missing_servers = list(set(efsservers_data.keys()) - set(inventory_data.keys()))
-    extra_servers = list(set(inventory_data.keys()) - set(efsservers_data.keys()))
+    mismatches = []
+    missing_servers = list(set(efs_data.keys()) - set(ax_inventory.keys()))
+    extra_servers = list(set(ax_inventory.keys()) - set(efs_data.keys()))
 
     if missing_servers:
-        print("\nMissing servers in inventory:")
+        print("\nMissing servers in AX Inventory:")
         print("==========================================================")
         for server in missing_servers:
             print(f" {server}")
 
     if extra_servers:
-        print("\nServers found in ax_inventories but not in Efs Database or efsserver.txt:")
+        print("\nServers found in AX Inventory but not in EFS Database:")
         print("==========================================================")
         for server in extra_servers:
             print(f" {server}")
 
-    # Validate each server's expected vs actual group
-    for server, expected_cells in efsservers_data.items():
-        group = determine_group_from_pattern(server)
+    for server, efs_details in efs_data.items():
+        ax_details = ax_inventory.get(server, {})
+        expected_group = ax_details.get("group", "UNKNOWN_GROUP")
+        actual_group = efs_details["group"]
 
-        if not group:
-            print(f"Server {server} does not match any known group.")
-            continue
+        expected_cells = ax_details.get("cells", set())
+        actual_cells = {efs_details["domain"]}  # Convert domain to set
 
-        # Normalize expected and actual cells for comparison
-        actual_cells = {normalize_cell(c) for c in inventory_data.get(server, set())}
-        expected_cells = {normalize_cell(c) for c in expected_cells}
+        print(f"\nChecking Server: {server}")  # Debugging
+        print(f" - Expected Group (from AX Inventory): {expected_group}")
+        print(f" - Actual Group (from EFS Database): {actual_group}")
+        print(f" - Expected Cells: {expected_cells}")
+        print(f" - Actual Cells: {actual_cells}")
 
-        if not actual_cells:
-            mismatches.append(f"\nMismatch for server: {server} in group {group}:")
-            mismatches.append(f" Efs Database: {expected_cells}")
-            mismatches.append(f" Ax inventory: (New Server)")
-        elif expected_cells != actual_cells:
+        if expected_group != actual_group:
+            mismatches.append(f"Mismatch: {server} -> Expected: {expected_group}, Found: {actual_group}")
+
+        if expected_cells != actual_cells:
             missing_cells = expected_cells - actual_cells
             extra_cells = actual_cells - expected_cells
 
-            mismatches.append(f"\n{server} in group {group}:")
-            mismatches.append(f" Efs Database: {expected_cells}")
-            mismatches.append(f" Ax inventory: {actual_cells}")
-
+            mismatches.append(f"{server} has cell mismatches:")
             if missing_cells:
-                mismatches.append(f" Cells in the Efs Database but not in the Ax inventory: {missing_cells}")
+                mismatches.append(f" Cells in AX Inventory but missing in EFS: {missing_cells}")
             if extra_cells:
-                mismatches.append(f" Cells in the Ax inventory but not in the Efs Database: {extra_cells}")
+                mismatches.append(f" Cells in EFS but missing in AX Inventory: {extra_cells}")
 
     if mismatches:
-        print("\nControl Group Validation:")
-        print("==========================================================")
-        print("\n".join(mismatches))
+        print("\n==== Mismatch Found ====")
+        for mismatch in mismatches:
+            print(mismatch)
     else:
-        print("==========================================================")
-        print("Controlgroup A and B are correctly balanced for high availability. \n")
+        print("\n✅ All servers are correctly assigned in AX Inventory!")
 
-# Validate inventory by comparing EFS servers
-def validate_inventory_with_efs():
-    """Validate EFS servers against dynamically generated patterns."""
-    efsservers_data = load_efs_unique_servers()
-    inventory_data = load_inventory_groups()
-
-    compare_cells(efsservers_data, inventory_data)
-
-# Run validation
-validate_inventory_with_efs()
-
-# Print dynamically generated mappings for verification
-print("\nDynamically Generated PATTERN_TO_GROUP:")
-for pattern, group in PATTERN_TO_GROUP.items():
-    print(f"{pattern} -> {group}")
+# Run Validation
+compare_efs_with_ax_inventory()
