@@ -1,220 +1,184 @@
 import yaml
 import re
 import os
-import subprocess
 import sys
+import subprocess
 from collections import deque
 
 ###############################################################################
-# 1) Name Normalization Helpers
+# 1) Normalization Helpers
 ###############################################################################
 
 def remove_all_spaces(s: str) -> str:
-    """
-    Remove *all* whitespace in a string: 
-      "lusva01efsd845.sdi. corp.bankofamerica. com" -> "lusva01efsd845.sdi.corp.bankofamerica.com"
-    """
+    """Remove all whitespace from a string."""
     return re.sub(r"\s+", "", s)
-
-def remove_spaces_around_dots(cell: str) -> str:
-    """
-    Remove weird spaces around dots in cell:
-      "p. usva02. ric. amrs. ml.com" -> "p.usva02.ric.amrs.ml.com"
-    """
-    # remove spaces around '.'
-    cell = re.sub(r"\s*\.\s*", ".", cell)
-    # remove leftover multiple spaces
-    cell = re.sub(r"\s+", "", cell)
-    return cell
 
 def unify_server_name(full_name: str) -> str:
     """
-    Steps:
-      1) Remove all whitespace
-      2) Lowercase
-      3) Remove domain after first '.'
-      4) Remove trailing digits after (efs|efsd|efsp|pefs|cefs)
+    1) Remove all spaces
+    2) Lowercase
+    3) Strip domain after first '.'
+    4) Remove trailing digits after efs/efsd/efsp/pefs/cefs
     """
     s = remove_all_spaces(full_name).lower()
-    # strip domain after first dot
     parts = s.split('.', 1)
     short = parts[0] if parts else s
-    # remove trailing digits after efs or efsd/efsp, pefs, cefs
     short = re.sub(r'(efs[dp]?|pefs|cefs)(\d+)$', r'\1', short)
     return short
 
 def normalize_cell(cell_name: str) -> str:
     """
-    1) Remove all spaces
-    2) Lowercase
-    3) Replace .m1.com -> .ml.com
-    4) Remove spaces around dots
+    Remove all spaces, lowercase, fix .m1.com -> .ml.com, etc.
     """
     c = remove_all_spaces(cell_name).lower()
     c = c.replace(".m1.com", ".ml.com")
-    c = remove_spaces_around_dots(c)
     return c
 
 ###############################################################################
-# 2) Parse EFS Data (4 columns)
+# 2) EFS Parsing (4 columns)
 ###############################################################################
 
 def get_efs_server_output():
-    """
-    Runs 'efs display efsserver' which yields lines like:
-      server, cell, dev/prod, group
-    We'll unify short server name for matching, but also store raw EFS name
-    for printing in mismatch lines.
-
-    Returns:
-      efs_data  = { short_name -> set of normalized_cells }
-      efs_raw   = { short_name -> raw server name (with spaces removed) }
-    """
     cmd = """efs display efsserver | sed -e '1,/^==*/d' | awk '{print $2 ", " $1 ", " $3 ", " $4}'"""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
 
-    efs_data = {}
-    efs_raw = {}
+    efs_data = {}    # { short_name -> set_of_cells }
+    efs_raw  = {}    # { short_name -> raw EFS server name (no spaces) }
 
     for line in result.stdout.strip().split("\n"):
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 4:
             continue
-        raw_server_name, raw_cell, _, _ = parts
 
-        # unify short name
-        short = unify_server_name(raw_server_name)
-        # store raw EFS name (spaces removed) for printing
-        no_space_efs_name = remove_all_spaces(raw_server_name)
-        if short not in efs_raw:
-            efs_raw[short] = no_space_efs_name
+        raw_srv, raw_cell, _, _ = parts
+        short_srv = unify_server_name(raw_srv)
+        no_space_srv = remove_all_spaces(raw_srv)
 
-        # normalize cell
+        if short_srv not in efs_raw:
+            efs_raw[short_srv] = no_space_srv
+
         cell_val = normalize_cell(raw_cell)
-
-        if short not in efs_data:
-            efs_data[short] = set()
-        efs_data[short].add(cell_val)
+        efs_data.setdefault(short_srv, set()).add(cell_val)
 
     return efs_data, efs_raw
 
 ###############################################################################
-# 3) BFS the entire YAML for 'hosts:' blocks
+# 3) BFS Inventory, capturing both cells AND group name
 ###############################################################################
 
-def load_inventory_anywhere(inventory_file: str):
+def bfs_load_inventory_with_groups(inventory_file):
     """
-    BFS scans entire inventory.prod.yaml, collecting all 'hosts:' blocks.
-    Returns:
-      inv_data   = { short_srv -> set_of_cells }
-      inv_rawmap = { short_srv -> raw server name (no spaces) }
+    BFS scan to find all 'hosts:' blocks. For each server:
+      - unify short name
+      - store { short_name -> (groupName, set_of_cells) }
+    We'll treat the dictionary key as the 'group' if it has a 'hosts:' subdict.
     """
     if not os.path.isfile(inventory_file):
-        print(f"❌ Error: file not found: {inventory_file}")
+        print(f"❌  Error: file not found: {inventory_file}")
         sys.exit(1)
 
     with open(inventory_file, "r") as f:
         doc = yaml.safe_load(f)
 
-    inv_data = {}
-    inv_rawmap = {}
-    queue = deque([doc])
+    inv_data = {}       # { short_srv -> (group_name, set_of_cells) }
+    inv_raw_map = {}    # { short_srv -> raw inventory server name (no spaces) }
+
+    queue = deque([(doc, "root")])  # store (node, parent_key)
 
     while queue:
-        node = queue.popleft()
+        node, parent_key = queue.popleft()
         if isinstance(node, dict):
-            # If there's a 'hosts' key
-            hosts = node.get("hosts", {})
-            if isinstance(hosts, dict):
-                for raw_srv, details in hosts.items():
+            # If node has 'hosts'
+            if "hosts" in node and isinstance(node["hosts"], dict):
+                # This parent's key might be our group name
+                group_name = parent_key
+                # parse each host
+                for raw_srv, details in node["hosts"].items():
                     if isinstance(details, dict):
                         short_srv = unify_server_name(raw_srv)
-                        no_space_inv_name = remove_all_spaces(raw_srv)
-                        # store the raw name if not stored yet
-                        if short_srv not in inv_rawmap:
-                            inv_rawmap[short_srv] = no_space_inv_name
+                        no_space_inv = remove_all_spaces(raw_srv)
+                        if short_srv not in inv_raw_map:
+                            inv_raw_map[short_srv] = no_space_inv
 
-                        # parse cells
-                        c_list = details.get("cells", [])
-                        norm_cells = {normalize_cell(c) for c in c_list}
-                        inv_data[short_srv] = norm_cells
+                        cell_list = details.get("cells", [])
+                        norm_cells = {normalize_cell(c) for c in cell_list}
+
+                        # store as (groupName, set_of_cells)
+                        inv_data[short_srv] = (group_name, norm_cells)
 
             # BFS deeper
-            for val in node.values():
-                if isinstance(val, dict):
-                    queue.append(val)
-                elif isinstance(val, list):
-                    for item in val:
+            for k, v in node.items():
+                if isinstance(v, dict):
+                    # pass child_key as next parent's name
+                    queue.append((v, k)) 
+                elif isinstance(v, list):
+                    for item in v:
                         if isinstance(item, dict):
-                            queue.append(item)
+                            # we keep the same parent_key
+                            queue.append((item, parent_key))
+
         elif isinstance(node, list):
             for item in node:
                 if isinstance(item, dict):
-                    queue.append(item)
+                    queue.append((item, parent_key))
 
-    return inv_data, inv_rawmap
+    return inv_data, inv_raw_map
 
 ###############################################################################
-# 4) Compare & Print
+# 4) Compare & Print with Group Info
 ###############################################################################
 
-def compare_cells(efs_data, efs_raw, inv_data, inv_raw):
+def compare_cells_with_groups(efs_data, efs_raw, inv_data, inv_raw):
     """
-    Compare EFS vs Inventory sets:
-      - "Servers found in EFS but not in ax_inventories"
-      - "Servers found in ax_inventories but not in Efs Database or efsserver.txt"
-      - For common servers, mismatch lines. 
-        "Mismatch for server: {raw_name}"
-        " Efs Database: {...}"
-        " Ax inventory: {...}"
-        missing/extra cells
+    inv_data: { short_name -> (groupName, set_of_cells) }
+    efs_data: { short_name -> set_of_cells }
+    We'll produce mismatch lines that say "Mismatch for server: raw_name in group {groupName}:"
     """
-
     efs_srvs = set(efs_data.keys())
     inv_srvs = set(inv_data.keys())
 
     missing_in_inventory = sorted(efs_srvs - inv_srvs)
     missing_in_efs       = sorted(inv_srvs - efs_srvs)
 
-    # EFS minus Inventory
     if missing_in_inventory:
         print("\nServers found in EFS Database but not in ax_inventories:")
         print("==========================================================")
-        for short in missing_in_inventory:
-            raw_name = efs_raw.get(short, short)
-            print(raw_name)
+        for short_srv in missing_in_inventory:
+            raw_efs_name = efs_raw.get(short_srv, short_srv)
+            print(raw_efs_name)
 
-    # Inventory minus EFS
     if missing_in_efs:
         print("\nServers found in ax_inventories but not in Efs Database or efsserver.txt:")
         print("==========================================================")
-        for short in missing_in_efs:
-            raw_name = inv_raw.get(short, short)
-            print(raw_name)
+        for short_srv in missing_in_efs:
+            # might not have a raw inventory name, fallback to short
+            groupName, _ = inv_data[short_srv]
+            raw_inv_name = inv_raw.get(short_srv, short_srv)
+            print(raw_inv_name)
 
-    # Common servers
     common = efs_srvs & inv_srvs
-    for short in sorted(common):
-        efs_cells = efs_data[short]
-        inv_cells = inv_data[short]
-        if efs_cells != inv_cells:
-            # prefer the EFS raw name if present, else inventory raw name
-            raw_efs = efs_raw.get(short)
-            raw_inv = inv_raw.get(short)
-            if raw_efs:
-                display_name = raw_efs
-            elif raw_inv:
-                display_name = raw_inv
-            else:
-                display_name = short
+    for short_srv in sorted(common):
+        efs_cells = efs_data[short_srv]
 
+        groupName, inv_cells = inv_data[short_srv]
+        raw_efs_name = efs_raw.get(short_srv)
+        raw_inv_name = inv_raw.get(short_srv)
+
+        # Which raw name do we display? Prefer EFS raw if it exists
+        if raw_efs_name:
+            display_name = raw_efs_name
+        elif raw_inv_name:
+            display_name = raw_inv_name
+        else:
+            display_name = short_srv
+
+        if efs_cells != inv_cells:
             missing_cells = efs_cells - inv_cells
             extra_cells   = inv_cells - efs_cells
 
-            print(f"\nMismatch for server: {display_name}")
+            print(f"\nMismatch for server: {display_name} in group {groupName}:")
             print(f" Efs Database: {efs_cells}")
             print(f" Ax inventory: {inv_cells}")
-
             if missing_cells:
                 print(f" Cells in the Efs Database but not in the Ax inventory: {missing_cells}")
             if extra_cells:
@@ -225,14 +189,14 @@ def compare_cells(efs_data, efs_raw, inv_data, inv_raw):
 ###############################################################################
 
 def validate_inventory_with_efs(inventory_file):
-    efs_data, efs_rawmap = get_efs_server_output()
-    inv_data, inv_rawmap = load_inventory_anywhere(inventory_file)
-    compare_cells(efs_data, efs_rawmap, inv_data, inv_rawmap)
+    efs_data, efs_raw = get_efs_server_output()
+    inv_data, inv_raw = bfs_load_inventory_with_groups(inventory_file)
+    compare_cells_with_groups(efs_data, efs_raw, inv_data, inv_raw)
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    inventory_file = os.path.join(script_dir, '..', 'prod', 'inventory.prod.yaml')
-    validate_inventory_with_efs(inventory_file)
+    inv_file = os.path.join(script_dir, "..", "prod", "inventory.prod.yaml")
+    validate_inventory_with_efs(inv_file)
 
 if __name__ == "__main__":
     main()
