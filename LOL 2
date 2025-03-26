@@ -47,15 +47,18 @@ def load_inventory():
     all_groups = inventory.get('all', {}).get('children', {})
 
     for group, group_data in all_groups.items():
-        if isinstance(group_data, dict):
-            # Extracting patterns correctly
-            for host in group_data.get("hosts", {}):
+        if not isinstance(group_data, dict):  
+            continue  # Skip if the group data is not a dictionary
+
+        # Extract patterns correctly
+        if "hosts" in group_data and isinstance(group_data["hosts"], dict):
+            for host in group_data["hosts"]:
                 pattern = host.split(".")[0] + ".*"  # Convert server name into a regex pattern
                 pattern_to_group[pattern] = group  # Assign it to the group
 
-            # Extracting hosts and cells
-            if "hosts" in group_data and isinstance(group_data["hosts"], dict):
-                for server, details in group_data["hosts"].items():
+            # Extract hosts and cells safely
+            for server, details in group_data["hosts"].items():
+                if isinstance(details, dict):
                     inventory_servers[server] = {
                         "group": group,
                         "cells": set(details.get("cells", [])) if "cells" in details else set()
