@@ -21,7 +21,7 @@ def get_efs_server_output():
                 "domain": domain,
                 "type": host_type,
                 "group": group,
-                "cells": set()
+                "cells": extract_efs_cells(server_name)
             }
     return servers
 
@@ -61,14 +61,14 @@ def determine_group_from_pattern(server_name, pattern_to_group):
     for pattern, group in pattern_to_group.items():
         if re.match(pattern, server_name):
             return group
-    return "NO_MATCH_FOUND"
+    return "UNKNOWN_GROUP"
 
 def extract_efs_cells(server_name):
-    """Dynamically generate EFS cell names from server structure."""
+    """Generates expected EFS cell names dynamically."""
     prefix = server_name.split('efs')[0]
     return {
-        f"p.{prefix}.ml.com",
-        f"d.{prefix}.ml.com"
+        f"p.{prefix}ml.com",
+        f"d.{prefix}ml.com"
     }
 
 def compare_efs_with_inventory():
@@ -99,15 +99,15 @@ def compare_efs_with_inventory():
         actual_group = efs_details["group"]
 
         expected_cells = inventory_details.get("cells", set())
-        actual_cells = extract_efs_cells(server)
+        actual_cells = efs_details["cells"]
 
-        if expected_group == "NO_MATCH_FOUND" and server in inventory_data:
+        if expected_group == "UNKNOWN_GROUP" and server in inventory_data:
             expected_group = inventory_data[server]["group"]
 
         if expected_group == actual_group and expected_cells == actual_cells:
             continue  # Server matches, no mismatch.
 
-        # Ensure proper formatting of sets
+        # Properly compare cells
         missing_cells = expected_cells - actual_cells
         extra_cells = actual_cells - expected_cells
 
