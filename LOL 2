@@ -1,6 +1,7 @@
 import subprocess
 import yaml
 import os
+import re
 
 # Load inventory file path
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,38 +32,48 @@ def get_efs_server_output():
 
 
 def load_inventory():
-    """Loads inventory servers and their assigned cells from inventory.prod.yaml."""
+    """Loads inventory servers, groups, and assigned cells from inventory.prod.yaml."""
     try:
         with open(inventory_file, 'r') as file:
             inventory = yaml.safe_load(file)
     except FileNotFoundError:
         print(f"❌ Error: Inventory file '{inventory_file}' not found.")
-        return {}
+        return {}, {}
 
     inventory_servers = {}
+    pattern_to_group = {}
 
-    # Extract servers from inventory file
+    # Extract pattern-to-group mapping from YAML
     all_groups = inventory.get('all', {}).get('children', {})
+
     for group, group_data in all_groups.items():
-        if "hosts" not in group_data or not isinstance(group_data["hosts"], dict):
-            continue  # Skip groups without hosts
+        if "hosts" in group_data and isinstance(group_data["hosts"], dict):
+            for server, details in group_data["hosts"].items():
+                if isinstance(details, dict):
+                    inventory_servers[server] = {
+                        "group": group,
+                        "cells": set(details.get("cells", [])) if "cells" in details else set()
+                    }
 
-        for server, details in group_data["hosts"].items():
-            if not isinstance(details, dict):
-                continue  # Skip malformed entries
+        # Extract regex pattern mapping if defined
+        if isinstance(group_data, dict) and "pattern" in group_data:
+            pattern_to_group[group_data["pattern"]] = group
 
-            inventory_servers[server] = {
-                "group": group,
-                "cells": set(details.get("cells", [])) if "cells" in details else set()
-            }
+    return inventory_servers, pattern_to_group
 
-    return inventory_servers
+
+def determine_group_from_pattern(server_name, pattern_to_group):
+    """Determine the correct group dynamically based on pattern matching."""
+    for pattern, group in pattern_to_group.items():
+        if re.match(pattern, server_name):
+            return group
+    return "UNKNOWN_GROUP"
 
 
 def compare_efs_with_inventory():
-    """Compares real-time EFS data against inventory.prod.yaml and shows only mismatches."""
+    """Compares real-time EFS data against inventory.prod.yaml dynamically."""
     efs_data = get_efs_server_output()
-    inventory_data = load_inventory()
+    inventory_data, pattern_to_group = load_inventory()
 
     mismatches = []
     outdated_servers = list(set(inventory_data.keys()) - set(efs_data.keys()))
@@ -83,7 +94,8 @@ def compare_efs_with_inventory():
     for server, efs_details in efs_data.items():
         inventory_details = inventory_data.get(server, {})
 
-        expected_group = inventory_details.get("group", "UNKNOWN_GROUP")
+        # Determine expected group dynamically using regex patterns
+        expected_group = determine_group_from_pattern(server, pattern_to_group)
         actual_group = efs_details["group"]
 
         expected_cells = inventory_details.get("cells", set())
@@ -95,7 +107,7 @@ def compare_efs_with_inventory():
 
         # If there's a mismatch, add it to the output
         mismatch_report = f"\n🔍 Mismatch for server: {server}"
-        mismatch_report += f"\n - Expected Group (Inventory): {expected_group}"
+        mismatch_report += f"\n - Expected Group (Dynamic): {expected_group}"
         mismatch_report += f"\n - Actual Group (EFS): {actual_group}"
 
         # Correcting the missing/extra cell reporting
