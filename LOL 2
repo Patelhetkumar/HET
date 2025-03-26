@@ -1,6 +1,5 @@
 import subprocess
 import yaml
-import re
 import os
 
 # Load inventory file path
@@ -66,6 +65,20 @@ def compare_efs_with_inventory():
     inventory_data = load_inventory()
 
     mismatches = []
+    outdated_servers = list(set(inventory_data.keys()) - set(efs_data.keys()))
+    missing_servers = list(set(efs_data.keys()) - set(inventory_data.keys()))
+
+    if outdated_servers:
+        print("\n🚨 Outdated (Decommissioned) Servers in Inventory (Not in EFS):")
+        print("==========================================================")
+        for server in outdated_servers:
+            print(f" {server}")
+
+    if missing_servers:
+        print("\n⚠️ Servers in EFS but Missing in Inventory:")
+        print("==========================================================")
+        for server in missing_servers:
+            print(f" {server}")
 
     for server, efs_details in efs_data.items():
         inventory_details = inventory_data.get(server, {})
@@ -86,12 +99,12 @@ def compare_efs_with_inventory():
         mismatch_report += f"\n - Actual Group (EFS): {actual_group}"
 
         # Cell mismatches
-        if expected_cells != actual_cells:
-            missing_cells = expected_cells - actual_cells
-            extra_cells = actual_cells - expected_cells
+        missing_cells = expected_cells - actual_cells
+        extra_cells = actual_cells - expected_cells
 
-            mismatch_report += f"\n - Cells in Inventory but missing in EFS: {missing_cells}" if missing_cells else ""
-            mismatch_report += f"\n - Cells in EFS but missing in Inventory: {extra_cells}" if extra_cells else ""
+        if missing_cells or extra_cells:
+            mismatch_report += f"\n - Cells in the AX inventory but not in the EFS Database: {missing_cells}" if missing_cells else ""
+            mismatch_report += f"\n - Cells in the EFS Database but not in the AX inventory: {extra_cells}" if extra_cells else ""
 
         mismatches.append(mismatch_report)
 
