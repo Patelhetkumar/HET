@@ -3,14 +3,14 @@ import re
 import os
 import subprocess
 import sys
-from collections import deque
-
-#################################
-# 1) Name Normalization
-#################################
+import json
 
 def unify_name(full_name):
-    """Strip domain, lowercase, remove trailing digits after efs(d/p)? etc."""
+    """
+    1) Strip domain at first '.' 
+    2) Lowercase
+    3) Remove trailing digits after efs(d/p), pefs, cefs
+    """
     short = full_name.split('.', 1)[0].lower()
     short = re.sub(r'(efs[dp]?|pefs|cefs)(\d+)$', r'\1', short)
     return short
@@ -20,10 +20,6 @@ def normalize_cell(cell_name):
     cell_name = cell_name.strip().lower()
     cell_name = cell_name.replace(".m1.com", ".ml.com")
     return cell_name
-
-#################################
-# 2) EFS Data Parsing
-#################################
 
 def get_efs_server_output():
     print("[DEBUG] Loading EFS data from command ...")
@@ -38,7 +34,6 @@ def get_efs_server_output():
         raw_srv, raw_cell, _, _ = parts
         srv = unify_name(raw_srv)
         cell = normalize_cell(raw_cell)
-
         if srv not in efs_data:
             efs_data[srv] = set()
         efs_data[srv].add(cell)
@@ -46,87 +41,75 @@ def get_efs_server_output():
     print(f"[DEBUG] EFS data servers count: {len(efs_data)}")
     return efs_data
 
-#################################
-# 3) “Brute-Force” BFS Over All YAML Keys
-#################################
-
-def load_inventory_anywhere(inventory_file):
+def load_inventory(inventory_file):
     """
-    Loads the entire inventory.prod.yaml and BFS/DFS through all dicts,
-    collecting any 'hosts' keys found along the way.
-
-    Returns: {unified_server -> set_of_cells}
+    Recursively parse the YAML, printing debug info 
+    so you can see exactly which 'hosts' are processed.
     """
     print("[DEBUG] Loading inventory YAML ...")
+
     if not os.path.isfile(inventory_file):
-        print(f"❌  Error: Inventory file '{inventory_file}' not found.")
+        print(f"❌  Error: inventory file '{inventory_file}' not found.")
         sys.exit(1)
 
     with open(inventory_file, 'r') as f:
         doc = yaml.safe_load(f)
 
+    # Print the entire doc for debug if you want:
+    # print("[DEBUG] Full doc:")
+    # print(json.dumps(doc, indent=4))
+
     inventory_data = {}
 
-    # We'll use a queue to BFS over all dictionaries
-    queue = deque()
-    queue.append(doc)  # Start from the root doc
-
-    while queue:
-        node = queue.popleft()
+    def recurse_groups(node, path_desc):
         if not isinstance(node, dict):
-            continue
+            return
 
-        # If node has a 'hosts' key, parse it
+        # If node has 'hosts'
         if "hosts" in node and isinstance(node["hosts"], dict):
-            print("[DEBUG] Found a 'hosts' block!")
+            print(f"[DEBUG] Found 'hosts' under path: {path_desc}")
             for raw_srv, details in node["hosts"].items():
-                if isinstance(details, dict):
-                    server_name = unify_name(raw_srv)
-                    cell_list   = details.get("cells", [])
-                    norm_cells  = {normalize_cell(c) for c in cell_list}
-                    inventory_data[server_name] = norm_cells
+                if not isinstance(details, dict):
+                    continue
+                unified_srv = unify_name(raw_srv)
+                cell_list   = details.get("cells", [])
+                norm_cells  = {normalize_cell(c) for c in cell_list}
+                inventory_data[unified_srv] = norm_cells
 
-        # Also check every key for further dicts
-        for v in node.values():
-            if isinstance(v, dict):
-                queue.append(v)
-            elif isinstance(v, list):
-                # If a list has dict items, enqueue them too
-                for item in v:
-                    if isinstance(item, dict):
-                        queue.append(item)
+        # If node has 'children'
+        children = node.get("children", {})
+        if isinstance(children, dict):
+            for child_key, child_val in children.items():
+                child_path = f"{path_desc}->{child_key}"
+                recurse_groups(child_val, child_path)
+
+    base_children = doc.get("all", {}).get("children", {})
+    print("[DEBUG] Processing 'hosts' under path: all->children")
+    recurse_groups(base_children, path_desc="all->children")
 
     print(f"[DEBUG] Inventory data servers count: {len(inventory_data)}")
     return inventory_data
 
-#################################
-# 4) Compare & Print
-#################################
-
 def compare_cells(efs_data, inventory_data):
     print("[DEBUG] Starting comparison ...")
-
     efs_servers = set(efs_data.keys())
     inv_servers = set(inventory_data.keys())
 
     missing_in_inventory = sorted(efs_servers - inv_servers)
     missing_in_efs       = sorted(inv_servers - efs_servers)
 
-    # 1) EFS - Inventory
     if missing_in_inventory:
         print("\nServers found in EFS Database but not in ax_inventories:")
         print("==========================================================")
-        for s in missing_in_inventory:
-            print(s)
+        for srv in missing_in_inventory:
+            print(srv)
 
-    # 2) Inventory - EFS
     if missing_in_efs:
         print("\nServers found in ax_inventories but not in Efs Database or efsserver.txt:")
         print("==========================================================")
-        for s in missing_in_efs:
-            print(s)
+        for srv in missing_in_efs:
+            print(srv)
 
-    # For common servers
     common = efs_servers & inv_servers
     for srv in sorted(common):
         efs_cells = efs_data[srv]
@@ -144,13 +127,9 @@ def compare_cells(efs_data, inventory_data):
             if extra_cells:
                 print(f" Cells in the Ax inventory but not in the Efs Database: {extra_cells}")
 
-#################################
-# 5) Orchestrator
-#################################
-
 def validate_inventory_with_efs(inventory_file):
     efs_data = get_efs_server_output()
-    inv_data = load_inventory_anywhere(inventory_file)
+    inv_data = load_inventory(inventory_file)
     compare_cells(efs_data, inv_data)
 
 def main():
