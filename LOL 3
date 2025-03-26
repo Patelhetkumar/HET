@@ -4,43 +4,39 @@ import os
 import subprocess
 import sys
 
-#####################################
+#############################
 # 1) Name Normalization
-#####################################
-
+#############################
 def unify_name(full_name):
     """
     1) Strip domain at first '.' (e.g. foo.apac.sdi.corp -> foo)
-    2) Lowercase the result
+    2) Lowercase
     3) Remove trailing digits after 'efs', 'efsd', or 'efsp'
-       (e.g. lauaulcefsp899 -> lauaulcefsp)
+       e.g. lauaulcefsp899 -> lauaulcefsp
     """
     short = full_name.split('.', 1)[0].lower()
+    # Remove trailing digits after efs or efs[d/p]? if you need that
     short = re.sub(r'(efs[dp]?)(\d+)$', r'\1', short)
     return short
 
 def normalize_cell(cell_name):
     """
-    Lowercase, trim, and replace .m1.com -> .ml.com.
+    Lowercase, strip spaces, replace .m1.com -> .ml.com
     """
     cell_name = cell_name.strip().lower()
     cell_name = cell_name.replace(".m1.com", ".ml.com")
     return cell_name
 
-#####################################
-# 2) Extract EFS Data
-#####################################
-
+#############################
+# 2) EFS Data Parsing
+#############################
 def get_efs_server_output():
     """
-    Runs 'efs display efsserver', which outputs 4 columns:
-      server_name, domain/cell, dev/prod, group
-
+    Runs 'efs display efsserver' to produce lines in format:
+      server, cell, dev/prod, group
     Example line:
       lauaulcefsp899.apac.sdi.corp..., d.auau2p.syd.aja.ml.com, prod, lauaulcefsp899...
-    We'll unify the server name, store cells in a set.
-
-    Returns efs_data = {unified_server: set_of_cells}
+    We'll unify the server name & store each cell in a set.
     """
     cmd = """efs display efsserver | sed -e '1,/^==*/d' | awk '{print $2 ", " $1 ", " $3 ", " $4}'"""
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
@@ -49,35 +45,35 @@ def get_efs_server_output():
     for line in result.stdout.strip().split("\n"):
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 4:
-            continue
-        raw_server = parts[0]
-        raw_cell   = parts[1]
-        # parts[2] = dev/prod, parts[3] = group (unused here)
+            continue  # skip malformed lines
 
-        srv  = unify_name(raw_server)
-        cell = normalize_cell(raw_cell)
+        raw_server_name = parts[0]  # e.g. lauaulcefsp899.apac...
+        raw_cell_name   = parts[1]  # e.g. d.auau2p.syd.aja.ml.com
+        # parts[2] = dev/prod, parts[3] = group
 
-        if srv not in efs_data:
-            efs_data[srv] = set()
-        efs_data[srv].add(cell)
+        server_name = unify_name(raw_server_name)
+        cell_name   = normalize_cell(raw_cell_name)
+
+        if server_name not in efs_data:
+            efs_data[server_name] = set()
+        efs_data[server_name].add(cell_name)
 
     return efs_data
 
-#####################################
-# 3) Load Inventory
-#####################################
-
+#############################
+# 3) Inventory Parsing
+#############################
 def load_inventory(inventory_file):
     """
-    Loads inventory.prod.yaml, returns {unified_server -> set_of_cells}.
-    Recursively processes 'children' blocks, merging 'hosts'.
+    Loads inventory.prod.yaml, building {unified_server -> set_of_cells}
+    by traversing nested 'children' blocks & 'hosts'.
     """
     if not os.path.isfile(inventory_file):
         print(f"❌  Error: inventory file '{inventory_file}' not found.")
         sys.exit(1)
 
-    with open(inventory_file, "r") as f:
-        data = yaml.safe_load(f)
+    with open(inventory_file, 'r') as f:
+        doc = yaml.safe_load(f)
 
     inventory_data = {}
 
@@ -85,65 +81,66 @@ def load_inventory(inventory_file):
         if not isinstance(node, dict):
             return
 
+        # If node has 'hosts'
         hosts = node.get("hosts", {})
         if isinstance(hosts, dict):
-            for raw_server, details in hosts.items():
+            for raw_srv, details in hosts.items():
                 if isinstance(details, dict):
-                    server_name = unify_name(raw_server)
+                    server_name = unify_name(raw_srv)
                     cell_list   = details.get("cells", [])
                     norm_cells  = {normalize_cell(c) for c in cell_list}
                     inventory_data[server_name] = norm_cells
 
+        # If node has 'children', recurse deeper
         children = node.get("children", {})
         if isinstance(children, dict):
             for _, child_val in children.items():
                 recurse_groups(child_val)
 
-    base = data.get("all", {}).get("children", {})
+    # Start from 'all' -> 'children'
+    base = doc.get("all", {}).get("children", {})
     recurse_groups(base)
+
     return inventory_data
 
-#####################################
-# 4) Compare & Print in Your Format
-#####################################
-
+#############################
+# 4) Compare & Print
+#############################
 def compare_cells(efsservers_data, inventory_data):
     """
-    EXACT format you requested:
-
-    1) missing_servers = list(EFS - Inventory)
-    2) extra_servers   = list(Inventory - EFS)
-
-    Then for each server in EFS:
-      if inventory is missing => "Mismatch for server..."
-      if EFS cells != inventory cells => show the cell differences
+    EXACT headings & style like your screenshots:
+      - missing servers in inventory
+      - servers found in ax_inventories but not in EFS
+      - for each mismatch, show Efs Database / Ax inventory, plus missing/extra cells
     """
+
     efs_servers = set(efsservers_data.keys())
     inv_servers = set(inventory_data.keys())
 
-    missing_servers = list(efs_servers - inv_servers)  # EFS minus inventory
-    extra_servers   = list(inv_servers - efs_servers)  # Inventory minus EFS
+    # 1) EFS - Inventory
+    missing_in_inventory = list(efs_servers - inv_servers)
+    # 2) Inventory - EFS
+    extra_in_efs = list(inv_servers - efs_servers)
 
-    if missing_servers:
+    if missing_in_inventory:
         print("\nServers found in EFS Database but not in ax_inventories:")
         print("==========================================================")
-        for srv in sorted(missing_servers):
+        for srv in sorted(missing_in_inventory):
             print(srv)
 
-    if extra_servers:
+    if extra_in_efs:
         print("\nServers found in ax_inventories but not in Efs Database or efsserver.txt:")
         print("==========================================================")
-        for srv in sorted(extra_servers):
+        for srv in sorted(extra_in_efs):
             print(srv)
 
-    # Compare common servers
+    # Check cell mismatches for servers in both
     common = efs_servers & inv_servers
     for srv in sorted(common):
         efs_cells = efsservers_data[srv]
         inv_cells = inventory_data[srv]
 
         if efs_cells != inv_cells:
-            # Mismatch
             missing_cells = efs_cells - inv_cells
             extra_cells   = inv_cells - efs_cells
 
@@ -156,12 +153,15 @@ def compare_cells(efsservers_data, inventory_data):
             if extra_cells:
                 print(f" Cells in the Ax inventory but not in the Efs Database: {extra_cells}")
 
-#####################################
+#############################
 # 5) Orchestrator
-#####################################
-
+#############################
 def validate_inventory_with_efs(inventory_file):
-    """Reads EFS data & Inventory, then compares them."""
+    """
+    1) parse EFS data
+    2) parse inventory
+    3) compare & print in the final format
+    """
     efs_data = get_efs_server_output()
     inv_data = load_inventory(inventory_file)
     compare_cells(efs_data, inv_data)
