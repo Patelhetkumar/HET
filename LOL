@@ -5,7 +5,7 @@ import os
 
 # Load AX Inventory file
 script_dir = os.path.dirname(os.path.abspath(__file__))
-inventory_file = os.path.join(script_dir, '..', 'prod', 'ax_inventory.prod.yaml')
+inventory_file = os.path.join(script_dir, '..', 'prod', 'inventory.prod.yaml')
 
 def get_efs_server_output():
     """Extracts server details from 'efs display efsserver' command dynamically."""
