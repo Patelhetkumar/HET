@@ -3,12 +3,13 @@ import yaml
 import re
 import os
 
-# Load AX Inventory file
+# Load inventory file path
 script_dir = os.path.dirname(os.path.abspath(__file__))
 inventory_file = os.path.join(script_dir, '..', 'prod', 'inventory.prod.yaml')
 
+
 def get_efs_server_output():
-    """Extracts server details from 'efs display efsserver' command dynamically."""
+    """Extracts real-time EFS server details using 'efs display efsserver'."""
     cmd = "efs display efsserver | awk 'NR>3 {print $2 \" \" $1 \" \" $3 \" \" $4}'"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
 
@@ -16,8 +17,8 @@ def get_efs_server_output():
     for line in result.stdout.strip().split("\n"):
         parts = line.strip().split()
         if len(parts) >= 4:  # Ensure at least: server_name, domain, type, group
-            server_name = parts[0]  # E.g., laau42efs899
-            domain = parts[1]       # E.g., apac.sdi.corp.bankofamerica.com
+            server_name = parts[0]  # E.g., luspa01efs849
+            domain = parts[1]       # E.g., sdi.corp.bankofamerica.com
             host_type = parts[2]    # E.g., dev/prod
             group = parts[3]        # E.g., l_aja_ausyb01sr1
             
@@ -29,72 +30,78 @@ def get_efs_server_output():
 
     return servers
 
-def load_ax_inventory():
-    """Loads predefined group mappings from AX inventory."""
-    with open(inventory_file, 'r') as file:
-        inventory = yaml.safe_load(file)
 
-    ax_mappings = {}
+def load_inventory():
+    """Loads inventory servers and their assigned cells from inventory.prod.yaml."""
+    try:
+        with open(inventory_file, 'r') as file:
+            inventory = yaml.safe_load(file)
+    except FileNotFoundError:
+        print(f"❌ Error: Inventory file '{inventory_file}' not found.")
+        return {}
 
-    # Extract group assignments from AX Inventory
+    inventory_servers = {}
+
+    # Extract servers from inventory file
     all_groups = inventory.get('all', {}).get('children', {})
-    
     for group, group_data in all_groups.items():
-        if not isinstance(group_data, dict) or "hosts" not in group_data:
-            print(f"Warning: Group '{group}' has no valid 'hosts' data. Skipping.")
-            continue  # Skip groups with no host data
-        
+        if "hosts" not in group_data or not isinstance(group_data["hosts"], dict):
+            print(f"⚠️ Warning: Group '{group}' has no valid 'hosts' data. Skipping.")
+            continue  # Skip groups without hosts
+
         for server, details in group_data["hosts"].items():
             if not isinstance(details, dict):
-                print(f"Warning: Server '{server}' in group '{group}' has invalid details. Skipping.")
+                print(f"⚠️ Warning: Server '{server}' in group '{group}' has invalid details. Skipping.")
                 continue  # Skip malformed entries
-            
-            ax_mappings[server] = {
+
+            inventory_servers[server] = {
                 "group": group,
                 "cells": set(details.get("cells", [])) if "cells" in details else set()
             }
 
-    return ax_mappings
+    return inventory_servers
 
-def compare_efs_with_ax_inventory():
-    """Compares dynamically extracted EFS data against AX Inventory."""
+
+def compare_efs_with_inventory():
+    """Compares real-time EFS data against inventory.prod.yaml."""
     efs_data = get_efs_server_output()
-    ax_inventory = load_ax_inventory()
+    inventory_data = load_inventory()
 
-    print("\n==== DEBUG: Comparing EFS Data with AX Inventory ====")
+    print("\n==== Validation: Comparing Inventory with Real EFS Data ====")
 
+    outdated_servers = list(set(inventory_data.keys()) - set(efs_data.keys()))
+    missing_servers = list(set(efs_data.keys()) - set(inventory_data.keys()))
     mismatches = []
-    missing_servers = list(set(efs_data.keys()) - set(ax_inventory.keys()))
-    extra_servers = list(set(ax_inventory.keys()) - set(efs_data.keys()))
+
+    if outdated_servers:
+        print("\n🚨 Outdated (Decommissioned) Servers in Inventory:")
+        print("==========================================================")
+        for server in outdated_servers:
+            print(f" {server}")
 
     if missing_servers:
-        print("\nMissing servers in AX Inventory:")
+        print("\n⚠️ Servers in EFS Database but Missing in Inventory:")
         print("==========================================================")
         for server in missing_servers:
             print(f" {server}")
 
-    if extra_servers:
-        print("\nServers found in AX Inventory but not in EFS Database:")
-        print("==========================================================")
-        for server in extra_servers:
-            print(f" {server}")
-
     for server, efs_details in efs_data.items():
-        ax_details = ax_inventory.get(server, {})
-        expected_group = ax_details.get("group", "UNKNOWN_GROUP")
+        inventory_details = inventory_data.get(server, {})
+
+        expected_group = inventory_details.get("group", "UNKNOWN_GROUP")
         actual_group = efs_details["group"]
 
-        expected_cells = ax_details.get("cells", set())
-        actual_cells = {efs_details["domain"]}  # Convert domain to set
+        expected_cells = inventory_details.get("cells", set())
+        actual_cells = {f"p.{server.split('efs')[0]}.ml.com"}  # Generate expected format
 
-        print(f"\nChecking Server: {server}")  # Debugging
-        print(f" - Expected Group (from AX Inventory): {expected_group}")
-        print(f" - Actual Group (from EFS Database): {actual_group}")
+        print(f"\n🔍 Checking Server: {server}")
+        print(f" - Expected Group (Inventory): {expected_group}")
+        print(f" - Actual Group (EFS): {actual_group}")
         print(f" - Expected Cells: {expected_cells}")
         print(f" - Actual Cells: {actual_cells}")
 
         if expected_group != actual_group:
-            mismatches.append(f"Mismatch: {server} -> Expected: {expected_group}, Found: {actual_group}")
+            mismatches.append(f"Group Mismatch: {server} -> Expected: {expected_group}, Found: {actual_group}")
 
         if expected_cells != actual_cells:
             missing_cells = expected_cells - actual_cells
@@ -102,16 +109,17 @@ def compare_efs_with_ax_inventory():
 
             mismatches.append(f"{server} has cell mismatches:")
             if missing_cells:
-                mismatches.append(f" Cells in AX Inventory but missing in EFS: {missing_cells}")
+                mismatches.append(f" Cells in Inventory but missing in EFS: {missing_cells}")
             if extra_cells:
-                mismatches.append(f" Cells in EFS but missing in AX Inventory: {extra_cells}")
+                mismatches.append(f" Cells in EFS but missing in Inventory: {extra_cells}")
 
     if mismatches:
-        print("\n==== Mismatch Found ====")
+        print("\n==== 🚨 Mismatches Found ====")
         for mismatch in mismatches:
             print(mismatch)
     else:
-        print("\n✅ All servers are correctly assigned in AX Inventory!")
+        print("\n✅ Inventory is fully aligned with EFS Database!")
+
 
 # Run Validation
-compare_efs_with_ax_inventory()
+compare_efs_with_inventory()
