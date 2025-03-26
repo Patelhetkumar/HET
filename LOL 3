@@ -1,0 +1,154 @@
+import yaml
+import re
+import os
+import subprocess
+import sys
+
+def get_efs_server_output():
+    """
+    Executes the efs display command (with 4 columns: server_name, domain/cell, dev/prod, group)
+    and returns a dict: {server_name -> set_of_cells}.
+    Example line format:
+      lauaulcefsp899.apac.sdi.corp.bankofamerica.com, d.auau2p.syd.aja.ml.com, prod, lauaulcefsp899...
+    """
+    # This command produces lines in the format:
+    #   server, domain/cell, dev/prod, group
+    cmd = """efs display efsserver | sed -e '1,/^==*/d' | awk '{print $2 ", " $1 ", " $3 ", " $4}'"""
+    
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, check=True)
+    efs_data = {}
+
+    for line in result.stdout.strip().split("\n"):
+        # line might look like: "lauaulcefsp899..., d.auau2p.syd.aja.ml.com, prod, lauaulcefsp899..."
+        parts = [p.strip() for p in line.strip().split(",")]
+        # We expect 4 parts: [0]=server_name, [1]=domain/cell, [2]=dev/prod, [3]=group
+        if len(parts) < 4:
+            continue  # skip malformed lines
+
+        # Normalize
+        server_name = parts[0].lower()
+        cell_name   = parts[1].lower()
+        host_type   = parts[2].lower()
+        group_name  = parts[3].lower()
+
+        # In your example, you want to store cell_name in a set
+        if server_name not in efs_data:
+            efs_data[server_name] = set()
+        # Add the domain/cell to the set
+        efs_data[server_name].add(cell_name)
+
+    return efs_data
+
+def load_inventory(inventory_file):
+    """Loads inventory.prod.yaml and extracts server->cells in a robust, recursive way."""
+    if not os.path.isfile(inventory_file):
+        print(f"❌  Error: inventory file '{inventory_file}' not found.")
+        sys.exit(1)
+
+    with open(inventory_file, 'r') as f:
+        inventory = yaml.safe_load(f)
+
+    inventory_data = {}
+
+    def extract_hosts_recursive(data):
+        """Recursively gather 'hosts' -> server -> cells from nested children."""
+        if not isinstance(data, dict):
+            return
+
+        # If 'hosts' exist, process them
+        hosts = data.get("hosts", {})
+        if isinstance(hosts, dict):
+            for srv, details in hosts.items():
+                normalized_srv = srv.strip().lower()
+                if isinstance(details, dict):
+                    # In your YAML, 'cells' is often a list. Turn it into a set.
+                    cell_list = details.get("cells", [])
+                    inventory_data[normalized_srv] = set(c.lower().strip() for c in cell_list)
+
+        # If 'children' exist, recurse further
+        children = data.get("children", {})
+        if isinstance(children, dict):
+            for _, child_val in children.items():
+                extract_hosts_recursive(child_val)
+
+    # Start from 'all' -> 'children'
+    all_children = inventory.get('all', {}).get('children', {})
+    extract_hosts_recursive(all_children)
+
+    return inventory_data
+
+def normalize_cell(cell_name):
+    """Normalize cell names by removing domain variations/spaces."""
+    cell_name = cell_name.strip().lower()
+    # Example: transform .m1.com -> .ml.com
+    cell_name = re.sub(r"\.m1\.com$", ".ml.com", cell_name)
+    return cell_name
+
+def compare_efs_with_inventory(efs_data, inventory_data):
+    """Compare the EFS data vs. inventory data. Show missing, extra, or mismatched cells."""
+    # Normalize cell names
+    for srv in efs_data:
+        efs_data[srv] = {normalize_cell(c) for c in efs_data[srv]}
+    for srv in inventory_data:
+        inventory_data[srv] = {normalize_cell(c) for c in inventory_data[srv]}
+
+    efs_servers = set(efs_data.keys())
+    inv_servers = set(inventory_data.keys())
+
+    # Identify servers
+    missing_in_efs = inv_servers - efs_servers  # in inventory, not in EFS
+    missing_in_inventory = efs_servers - inv_servers  # in EFS, not in inventory
+
+    if missing_in_efs:
+        print("\nServers found in Inventory but NOT in EFS Database:")
+        print("==========================================================")
+        for s in sorted(missing_in_efs):
+            print(s)
+
+    if missing_in_inventory:
+        print("\nServers found in EFS Database but NOT in Inventory:")
+        print("==========================================================")
+        for s in sorted(missing_in_inventory):
+            print(s)
+
+    # Compare cells for common servers
+    common_servers = efs_servers & inv_servers
+    mismatch_found = False
+    for srv in sorted(common_servers):
+        efs_cells = efs_data[srv]
+        inv_cells = inventory_data[srv]
+        if efs_cells != inv_cells:
+            mismatch_found = True
+            missing_cells = efs_cells - inv_cells
+            extra_cells   = inv_cells - efs_cells
+
+            print(f"\nMismatch for server: {srv}")
+            print(f" Efs Database: {efs_cells}")
+            print(f" Ax inventory: {inv_cells}")
+
+            if missing_cells:
+                print(f" Cells in the EFS Database but not in the Ax inventory: {missing_cells}")
+            if extra_cells:
+                print(f" Cells in the Ax inventory but not in the EFS Database: {extra_cells}")
+
+    if not missing_in_efs and not missing_in_inventory and not mismatch_found:
+        print("\n✅ All servers and cells match between EFS Database and Inventory!")
+    else:
+        print("\n✅ Comparison complete.")
+
+def main():
+    """Main function that orchestrates the entire validation process."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 1) Load the YAML inventory
+    inventory_file = os.path.join(script_dir, '..', 'prod', 'inventory.prod.yaml')
+    inventory_data = load_inventory(inventory_file)
+
+    # 2) Parse real-time EFS data from the efs display efsserver command
+    efs_data = get_efs_server_output()
+
+    # 3) Compare & print mismatches
+    compare_efs_with_inventory(efs_data, inventory_data)
+
+if __name__ == "__main__":
+    main()
