@@ -104,6 +104,13 @@ def determine_group_from_pattern(server_name):
             return group
     return "UNKNOWN_GROUP"  # Default if no match is found
 
+def normalize_cell(cell_name):
+    """Normalize cell names to remove inconsistencies (e.g., extra spaces, domain variations)."""
+    cell_name = cell_name.strip()  # Remove leading/trailing spaces
+    cell_name = re.sub(r'\s+', '', cell_name)  # Remove internal spaces
+    cell_name = cell_name.replace(".m1.com", ".ml.com")  # Standardize domain variations
+    return cell_name
+
 def compare_cells(efsservers_data, inventory_data):
     """Compare expected and actual cells and print discrepancies to console."""
     
